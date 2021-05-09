@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "pdarts_autogoal"
+version = "0.0.1"
+description = "End-to-end AutoML pipeline system leveraging P-Darts and AutoGOAL"
+authors = ["Gabriel Cemaj"]
+
+packages = [
+    {include="", from="src"}
+]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+autogoal = "^0.6.0"
+torch = "^1.8.1"
+torchvision = "^0.9.1"
+
+[tool.poetry.dev-dependencies]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
