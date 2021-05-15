@@ -20,3 +20,40 @@ We expose this to allow AutoGOAL to explore the grammar correctly and generate v
 ### pipeline
 Here we define the overall system, we create a class that when given to AutoGOAL will generate valid end-2-end pipelines
 
+## Example
+
+Running a sample pipeline for MNIST
+
+```python
+from torchvision.datasets import CIFAR10, MNIST
+
+from autogoal.grammar import generate_cfg
+from autogoal.search import RandomSearch, PESearch, RichLogger
+
+from pdarts_autogoal.pipeline import Pipeline
+from pdarts_autogoal.pdarts.genotypes import Genotype
+
+grammar = generate_cfg(Pipeline)
+
+train_data = MNIST(
+    root='./data', train=True, download=True
+)
+
+val_data = MNIST(
+    root='./data', train=False, download=True
+)
+
+def evaluate(candidate):
+    v, _ = candidate.fit(train_data, val_data)
+    return v
+    
+search_pe = PESearch(
+    grammar, 
+    evaluate, 
+    pop_size=1, 
+    evaluation_timeout=0,
+    memory_limit=0,
+    search_timeout=0
+)
+best_pe, best_fn_pe = search_pe.run(10, logger=RichLogger())
+```
