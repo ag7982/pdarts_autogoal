@@ -16,7 +16,7 @@ class RandomAffine(_RandomAffine):
         degrees: ContinuousValue(0, 360),
         translate_w: ContinuousValue(0, 1),
         translate_h: ContinuousValue(0, 1),
-        scale_min: ContinuousValue(0, 1),
+        scale_min: ContinuousValue(0.1, 1),
         scale_range: ContinuousValue(1, 10),
         shear: ContinuousValue(0, 360),
         is_enabled: BooleanValue()

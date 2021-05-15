@@ -1,17 +1,18 @@
 from torch.utils.data import DataLoader
 from autogoal.grammar import *
+from autogoal.utils import nice_repr
 
 from ..preprocessing import Preprocessor
 from ..pdarts import PDarts
 
-
+@nice_repr
 class Pipeline:
 
     def __init__(
         self,
         preprocessing: Preprocessor,
         pdarts: PDarts,
-        batch_size: DiscreteValue(60, 180),
+        batch_size: DiscreteValue(60, 96),
 
     ):
 
@@ -40,4 +41,4 @@ class Pipeline:
         train_dataset.transform = train_transform
         valid_dataset.transform = valid_transform
 
-        self.pdarts.fit(train_loader, valid_loader)
+        return self.pdarts.fit(train_loader, valid_loader)

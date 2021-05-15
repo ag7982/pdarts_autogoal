@@ -1,5 +1,5 @@
 import torch
-from torchvision.transforms import RandomCrop, Normalize, ToTensor, Compose
+from torchvision.transforms import RandomCrop, Normalize, ToTensor, Compose, Grayscale
 from torch.utils.data import DataLoader
 
 from autogoal.grammar import *
@@ -31,7 +31,7 @@ class Preprocessor:
         self.crop = crop
 
     def _get_stats(self, dataset):
-        dataset.transform = ToTensor()
+        dataset.transform = Compose([ Grayscale(3),ToTensor()])
         loader = DataLoader(
             dataset, 
             batch_size=100, 
@@ -54,13 +54,14 @@ class Preprocessor:
                 chsum += (inputs - mean).pow(2).sum(dim=(0, 2, 3), keepdim=True)
         std = torch.sqrt(chsum/(len(dataset) * h * w - 1))
 
-        return mean.unsqueeze(0), std.unsqueeze(0), h, w
+        return mean.squeeze(0), std.squeeze(0), h, w
 
     
     def fit(self, train_dataset):
         mean, std, h, w = self._get_stats(train_dataset)
 
         train_transform = [
+#             Grayscale(3),
             self.blur if self.blur.is_enabled else None,
             self.affine if self.affine.is_enabled else None, 
             self.h_flip if self.h_flip.is_enabled else None,
@@ -72,9 +73,12 @@ class Preprocessor:
         ]
 
         valid_transform = [
+            Grayscale(3),
             ToTensor(),
             Normalize(mean, std) if self.norm else None
         ]
+        
+        print([i for i in train_transform if i is not None])
 
         return (
             Compose([i for i in train_transform if i is not None]),

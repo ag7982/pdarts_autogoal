@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import SGD, Adam, RMSprop, Optimizer
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
@@ -8,6 +9,7 @@ from autogoal.grammar import *
 from autogoal.utils import nice_repr
 
 import time
+import copy
 
 from .utils import AvgrageMeter
 from .genotypes import Genotype
@@ -29,20 +31,20 @@ class PDarts:
         epochs: DiscreteValue(10, 25),
         warmup_epochs: DiscreteValue(5, 10),
         init_channels: DiscreteValue(8, 32),
-        layers: DiscreteValue(2, 10),
+        layers: DiscreteValue(2, 3),
         grad_clip: ContinuousValue(-1.0, 1.0) ,
-        dropout_rate: ContinuousValue(0.0, 1.0),
+        dropout_rate: ContinuousValue(0.0, 0.8),
         arch_dropout_rate: ContinuousValue(0.0, 1.0),
-        learning_rate: ContinuousValue(0.0, 0.1),
-        arch_learning_rate: ContinuousValue(0.0, 0.1),
-        learning_rate_min: ContinuousValue(0.0, 0.01),
+        learning_rate: ContinuousValue(0.0001, 0.1),
+        arch_learning_rate: ContinuousValue(0.0001, 0.1),
+        learning_rate_min: ContinuousValue(0.0001, 0.01),
     ):
         self.has_cuda = torch.cuda.is_available()
         self.device = (
             torch.device("cuda") if self.has_cuda else torch.device("cpu")
         )
 
-        self.criterion = nn.CrossEntropyLoss().cuda() if self.has_cuda else nn.CrossEntropyLoss()
+        self.criterion = nn.CrossEntropyLoss().to(self.device)
 
         self.switches_normal = [ [True for _ in PRIMITIVES] for _ in range(14)]
         self.switches_reduce = [ [True for _ in PRIMITIVES] for _ in range(14)]
@@ -65,13 +67,16 @@ class PDarts:
 
     @staticmethod
     def _accuracy_topk(output, target, topk=(1,)):
-        _, pred = output.topk(max(topk), 1, True, True)
-        correct = pred.eq(target.view(1, -1).expand_as(pred.t()))
+        with torch.no_grad():
+            _, pred = output.topk(max(topk), 1, True, True)
+            pred = pred.t()
+            correct = pred.eq(target.view(1, -1).expand_as(pred))
 
-        return [
-            correct[:k].view(-1).float().sum(0).mul_(100.0/target.size(0))
-            for k in topk
-        ]
+
+            return [
+                correct[:k].contiguous().view(-1).float().sum(0).mul_(100.0/target.size(0))
+                for k in topk
+            ]
 
     @staticmethod
     def _get_min_k(input_in, k):
@@ -88,7 +93,7 @@ class PDarts:
     def _get_min_k_no_zero(w_in, idxs, k):
         w = copy.deepcopy(w_in)
         index = []
-        zf = 0 in idxs 
+        zf = bool(0 in idxs) 
         if zf:
             w = w[1:]
             index.append(0)
@@ -96,7 +101,8 @@ class PDarts:
         for i in range(k):
             idx = np.argmin(w)
             w[idx] = 1
-            idx += 1 if zf else 0
+            if zf:
+                idx += 1
             index.append(idx)
         return index
 
@@ -122,7 +128,7 @@ class PDarts:
                 weight_decay=self.arch_weight_decay
             )
 
-    def _run_inner(self, train_loader, valid_loader, classes, num_to_drop, add_layer):
+    def _run_inner(self, train_loader, valid_loader, classes, add_layer):
         model = Network(
             self.init_channels, 
             classes, 
@@ -132,6 +138,7 @@ class PDarts:
             switches_reduce=self.switches_reduce, 
             probability=self.dropout_rate
         )
+        model = model.to(self.device)
         network_params = [
             v
             for k, v in model.named_parameters()
@@ -171,7 +178,7 @@ class PDarts:
                 )
             else:
                 model.update_probability(
-                    self.dropout_rate * np.exp(-(epoch - self.warmup_epochs) * 0.2)
+                    min(self.dropout_rate * np.exp(-(epoch - self.warmup_epochs) * 0.2), 1.0)
                 )                
                 train_acc, train_obj = self._train(
                     train_loader, 
@@ -182,12 +189,12 @@ class PDarts:
                     optimizer_arch, 
                     train_arch=True
                 )
-            print(train_acc)
             scheduler.step()
             epoch_duration = time.time() - epoch_start
+            print(f"{epoch_duration=}: {epoch=} {train_acc=}")
         return model
 
-    def _set_switches(self, arch_param):
+    def _set_switches(self, arch_param, num_to_drop):
         # drop operations with low architecture weights
         normal_prob = F.softmax(arch_param[0], dim=-1).data.cpu().numpy()
         reduce_prob = F.softmax(arch_param[1], dim=-1).data.cpu().numpy()
@@ -195,9 +202,9 @@ class PDarts:
         for i in range(14):
             idxs_normal, idxs_reduce = [], []
             for j in range(len(PRIMITIVES)):
-                if switches_normal[i][j]:
+                if self.switches_normal[i][j]:
                     idxs_normal.append(j)
-                if switches_reduce[i][j]:
+                if self.switches_reduce[i][j]:
                     idxs_reduce.append(j)
             for idx in self._get_min_k(normal_prob[i, :], num_to_drop):
                 self.switches_normal[i][idxs_normal[idx]] = False
@@ -205,22 +212,23 @@ class PDarts:
             for idx in self._get_min_k(reduce_prob[i, :], num_to_drop):
                 self.switches_reduce[i][idxs_reduce[idx]] = False
         
-    def _on_last(self, arch_param):
+    def _on_last(self, arch_param, num_to_drop):
         normal_prob = F.softmax(arch_param[0], dim=-1).data.cpu().numpy()
         reduce_prob = F.softmax(arch_param[1], dim=-1).data.cpu().numpy()
       
-        for i in range(14):
-            idxs_normal, idxs_reduce = [], []
-            for j in range(len(PRIMITIVES)):
-                if switches_normal[i][j]:
-                    idxs_normal.append(j)
-                if switches_reduce[i][j]:
-                    idxs_reduce.append(j)
-            for idx in self._get_min_k_no_zero(normal_prob[i, :], idxs_normal, num_to_drop):
-                self.switches_normal[i][idxs_normal[idx]] = False
+#         for i in range(14):
+#             idxs_normal, idxs_reduce = [], []
+#             for j in range(len(PRIMITIVES)):
+#                 if self.switches_normal[i][j]:
+#                     idxs_normal.append(j)
+#                 if self.switches_reduce[i][j]:
+#                     idxs_reduce.append(j)
+#             print(idxs_normal)
+#             for idx in self._get_min_k(normal_prob[i, :], num_to_drop):
+#                 self.switches_normal[i][idxs_normal[idx]] = False
 
-            for idx in self._get_min_k_no_zero(reduce_prob[i, :], idxs_reduce, num_to_drop):
-                self.switches_reduce[i][idxs_reduce[idx]] = False
+#             for idx in self._get_min_k(reduce_prob[i, :], num_to_drop):
+#                 self.switches_reduce[i][idxs_reduce[idx]] = False
 
         switches_normal = copy.deepcopy(self.switches_normal)
         switches_reduce = copy.deepcopy(self.switches_reduce)
@@ -264,16 +272,19 @@ class PDarts:
 
     def _train(self, train_queue, valid_queue, model, network_params, optimizer, optimizer_arch, train_arch=True):
         objs, top1, top5 = AvgrageMeter(), AvgrageMeter(), AvgrageMeter()
-        
         for step, (inputs, target) in enumerate(train_queue):
             model.train()
             n = inputs.size(0)
-            inputs = inputs.cuda() if self.has_cuda else inputs
-            target = target.cuda(non_blocking=True) if self.has_cuda else target
+            inputs = inputs.to(self.device)
+            target = target.to(self.device)
             if train_arch:
-                input_search, target_search = next(valid_queue_iter)
-                input_search = input_search.cuda()
-                target_search = target_search.cuda(non_blocking=True)
+                try:
+                    input_search, target_search = next(valid_queue_iter)
+                except:
+                    valid_queue_iter = iter(valid_queue)
+                    input_search, target_search = next(valid_queue_iter)
+                input_search = input_search.to(self.device)
+                target_search = target_search.to(self.device)
                 optimizer_arch.zero_grad()
                 loss_arch = self.criterion(
                     model(input_search), target_search
@@ -281,7 +292,7 @@ class PDarts:
                 loss_arch.backward()
                 nn.utils.clip_grad_norm_(model.arch_parameters(), self.grad_clip)
                 optimizer_arch.step()
-
+            
             optimizer.zero_grad()
             logits = model(inputs)
             loss = self.criterion(logits, target)
@@ -291,7 +302,26 @@ class PDarts:
             optimizer.step()
 
             prec1, prec5 = self._accuracy_topk(logits, target, topk=(1, 5))
-            print(prec1)
+            objs.update(loss.data.item(), n)
+            top1.update(prec1.data.item(), n)
+            top5.update(prec5.data.item(), n)
+
+        return top1.avg, objs.avg
+    
+    def _infer(self, valid_queue, model):
+        objs, top1, top5 = AvgrageMeter(), AvgrageMeter(), AvgrageMeter()
+
+        model.eval()
+
+        for step, (inputs, target) in enumerate(valid_queue):
+            inputs = inputs.to(self.device)
+            target = target.to(self.device)
+            with torch.no_grad():
+                logits = model(inputs)
+                loss = self.criterion(logits, target)
+
+            prec1, prec5 = self._accuracy_topk(logits, target, topk=(1, 5))
+            n = inputs.size(0)
             objs.update(loss.data.item(), n)
             top1.update(prec1.data.item(), n)
             top5.update(prec5.data.item(), n)
@@ -323,20 +353,20 @@ class PDarts:
         )
 
     def fit(self, train_loader, valid_loader):
-        add_layer = [0, 5, 11]
+        add_layer = [0, 1, 2]
         drop_layer = [3, 2, 2]
 
         for add_l, drop_l in zip(add_layer, drop_layer):
-            print("inner", add_l, drop_l)
             model = self._run_inner(
                 train_loader,
                 valid_loader,
                 len(train_loader.dataset.classes),
-                drop_l,
                 add_l
             )
-            self._set_switches(model.arch_parameters())
+            self._set_switches(model.arch_parameters(), drop_l)
         
-        self._on_last(model.arch_parameters())
+        self._on_last(model.arch_parameters(), drop_l)
 
         print(self._parse_network())
+        
+        return self._infer(valid_loader, model)
